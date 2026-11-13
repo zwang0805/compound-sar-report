@@ -1,0 +1,5 @@
+# Everything this skill needs; no other project files are used.
+rdkit
+pandas
+numpy
+scipy
