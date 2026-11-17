@@ -131,6 +131,27 @@ def _grade_badge(g):
 # --------------------------------------------------------------------------
 # small helpers
 # --------------------------------------------------------------------------
+def _name_str(v):
+    """A molecule name as text, or None when missing. Names are often purely
+    numeric ('1', '48', ...), in which case pandas reads the name column as
+    int64/float64 — an `isinstance(v, str)` check then wrongly treated every
+    such molecule as unnamed. Integer-valued floats ('48.0' after a NaN forced
+    the column to float) are written as '48'."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.strip()
+        return v if v and v != 'nan' else None
+    try:
+        if v != v:
+            return None
+    except Exception:
+        pass
+    if isinstance(v, (float, np.floating)) and float(v).is_integer():
+        return str(int(v))
+    return str(v)
+
+
 def _canon(smi):
     m = Chem.MolFromSmiles(smi) if isinstance(smi, str) else None
     return Chem.MolToSmiles(m) if m is not None else None
@@ -494,7 +515,7 @@ def _fragment_occurrence_info(raw, cut_type, core_at_level, level, props):
     for frag_canon, g in occ.groupby('frag_canon'):
         molecules = []
         for _, row in g.iterrows():
-            name = row['name'] if isinstance(row['name'], str) and row['name'] != 'nan' else None
+            name = _name_str(row['name'])
             values = {label: (row[f'value__{label}'] if pd.notna(row[f'value__{label}']) else None)
                       for label in value_map_1}
             molecules.append({'smiles': row['mol'], 'name': name, 'values': values})
@@ -523,8 +544,8 @@ def _collect_absolute_values(raw, props):
             canon = _canon(smi) or smi
             rec = out.setdefault(canon, {'name': None, 'values': {}})
             if name_col in raw.columns:
-                nm = row[name_col]
-                if isinstance(nm, str) and nm != 'nan' and not rec['name']:
+                nm = _name_str(row[name_col])
+                if nm and not rec['name']:
                     rec['name'] = nm
             for label, col in value_map.items():
                 if not col or col not in raw.columns:
