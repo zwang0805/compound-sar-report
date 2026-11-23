@@ -242,20 +242,31 @@ def _strip_stars_canon(smi):
         return None
 
 
-def _frag_atom_indices(mol, frag_smiles):
-    """Atom indices in `mol` covered by a fragment's heavy-atom skeleton
-    (its '*' attachment points stripped) — _enumerate_sites() discards the
-    atom-index provenance of a cut (mmp_frag_and_index.py converts fragments
-    to SMILES, not index maps), so highlighting a site's region on the
-    original molecule has to re-derive it via substructure match instead.
-    Returns an empty frozenset for a bare '*[H]' fragment (no substituent to
-    highlight) and None if the skeleton can't be matched back onto `mol`."""
+def _frag_atom_indices(mol, frag_smiles, core_smiles=None):
+    """Atom indices in `mol` covered by a fragment's heavy-atom skeleton (its '*'
+    attachment points stripped) — _enumerate_sites() discards the atom-index
+    provenance of a cut (mmp_frag_and_index.py converts fragments to SMILES, not
+    index maps), so highlighting a site's region on the original molecule has to
+    re-derive it via substructure match instead.
+
+    Taking the FIRST substructure match is not good enough: a fragment like
+    '*CC1CCC1' (cyclobutylmethyl) matches several places in a flexible molecule, and
+    the first one is usually not the position this cut actually is — the overview
+    then colours an unrelated part of the structure while the region's cards list
+    that position's R-groups. So every match is enumerated and the right one is
+    identified by the cut itself: the site's own core and this fragment must
+    PARTITION the molecule (disjoint, together every atom) with exactly as many
+    bonds crossing between the two halves as the cut had attachment points.
+
+    Returns an empty frozenset for a bare '*[H]' fragment (nothing to highlight),
+    and None when the position cannot be pinned down — a missing highlight is
+    better than a wrong one."""
     frag = Chem.MolFromSmiles(frag_smiles) if frag_smiles else None
     if frag is None:
         return None
+    k = sum(1 for a in frag.GetAtoms() if a.GetAtomicNum() == 0)
     rw = Chem.RWMol(frag)
-    dummies = sorted((a.GetIdx() for a in frag.GetAtoms() if a.GetAtomicNum() == 0), reverse=True)
-    for idx in dummies:
+    for idx in sorted((a.GetIdx() for a in frag.GetAtoms() if a.GetAtomicNum() == 0), reverse=True):
         rw.RemoveAtom(idx)
     if rw.GetNumAtoms() == 0:
         return frozenset()
@@ -269,25 +280,65 @@ def _frag_atom_indices(mol, frag_smiles):
         a.SetNoImplicit(False)
         a.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
     try:
-        skeleton = rw.GetMol()
-        Chem.SanitizeMol(skeleton)
+        query = rw.GetMol()
+        Chem.SanitizeMol(query)
     except Exception:
         # Stripping the '*' left an atom that can't be sanitised on its own — typically
         # an aromatic [n] in a pyridone-type ring whose '*' substituent (e.g. the
-        # N-methyl of a double-cut fragment) was its third connection. Before this
-        # fallback such a position resolved to None, i.e. "unknown region", which
-        # _select_nonoverlapping_sites treats as never overlapping anything — so it
-        # was never merged into the better-supported position it actually sits on.
-        # Match the fragment as written instead, with each '*' as a wildcard; only the
-        # non-'*' matches count as the fragment's own atoms.
-        # (read as SMARTS, where '*' is a real wildcard; atom order is the SMILES's own)
+        # N-methyl of a double-cut fragment) was its third connection. Read the
+        # fragment as SMARTS instead, where each '*' is a real wildcard.
         query = Chem.MolFromSmarts(frag_smiles)
-        match = mol.GetSubstructMatch(query) if query is not None else ()
-        if not match or query.GetNumAtoms() != frag.GetNumAtoms():
+        if query is None or query.GetNumAtoms() != frag.GetNumAtoms():
             return None
-        return frozenset(m for m, fa in zip(match, frag.GetAtoms()) if fa.GetAtomicNum() != 0)
-    match = mol.GetSubstructMatch(skeleton)
-    return frozenset(match) if match else None
+    dummy_pos = {i for i, a in enumerate(query.GetAtoms()) if a.GetAtomicNum() == 0}
+    matches = mol.GetSubstructMatches(query, uniquify=False, maxMatches=2000)
+    if not matches:
+        return None
+    sets = list(dict.fromkeys(
+        frozenset(a for i, a in enumerate(mt) if i not in dummy_pos) for mt in matches))
+    if len(sets) == 1:
+        return sets[0]
+    if not core_smiles:
+        return None
+
+    # --- disambiguate with the cut: core + fragment must partition the molecule ---
+    core = Chem.MolFromSmiles(core_smiles)
+    if core is None:
+        return None
+    c_rw = Chem.RWMol(core)
+    for idx in sorted((a.GetIdx() for a in core.GetAtoms() if a.GetAtomicNum() == 0), reverse=True):
+        c_rw.RemoveAtom(idx)
+    for a in c_rw.GetAtoms():
+        a.SetNoImplicit(False)
+        a.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
+    try:
+        c_query = c_rw.GetMol()
+        Chem.SanitizeMol(c_query)
+    except Exception:
+        c_query = Chem.MolFromSmarts(core_smiles)
+        if c_query is None:
+            return None
+    core_matches = mol.GetSubstructMatches(c_query, uniquify=False, maxMatches=500)
+    if not core_matches:
+        return None
+    n_atoms = mol.GetNumAtoms()
+    nbrs = [[nb.GetIdx() for nb in a.GetNeighbors()] for a in mol.GetAtoms()]
+    kept = []
+    for fset in sets:
+        for cm in core_matches:
+            cset = set(cm)
+            if not fset.isdisjoint(cset) or len(fset) + len(cset) != n_atoms:
+                continue
+            crossing = sum(1 for a in fset for nb in nbrs[a] if nb not in fset)
+            if crossing == k:
+                kept.append(fset)
+                break
+    if not kept:
+        return None
+    # more than one surviving partition: the molecule genuinely offers several
+    # equivalent cuts of this fragment (symmetry) — any of them draws the same
+    # region, so take the first rather than dropping the highlight
+    return kept[0]
 
 
 def _select_nonoverlapping_sites(sites_with_data, mol):
@@ -301,7 +352,7 @@ def _select_nonoverlapping_sites(sites_with_data, mol):
     selected = []
     used_atoms = set()
     for s in sites_with_data:
-        atoms = _frag_atom_indices(mol, s['R1']) or frozenset()
+        atoms = _frag_atom_indices(mol, s['R1'], s['core']) or frozenset()
         if atoms and (used_atoms & atoms):
             continue
         selected.append((s, atoms))
