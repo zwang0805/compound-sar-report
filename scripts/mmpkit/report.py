@@ -462,6 +462,122 @@ def _attach(core_smiles, frag_smiles):
         return None
 
 
+def _attach_k(core_smiles, frag_smiles, perm=None):
+    """Join a k-* core with a k-* fragment (k = 1..3) into a molecule (SMILES) — None on failure.
+
+    `perm[i]` is the dummy atom of the fragment bonded at the i-th dummy atom of
+    the core. Deposits cut mol1 and mol2 independently, so the dummy order is NOT
+    a reliable convention across a pair — the pairing has to be validated
+    (see _design_from_pair).
+
+    The join goes through Chem.molzip with atom-map numbers on the dummies: doing
+    it by hand (bond the two neighbours, then delete the dummies) silently
+    inverts every stereocentre at the joined atom, because the new bond is
+    appended to the atom's bond list and the stored chiral tag is read against
+    that order.
+
+    k == 1 delegates to _attach (which also handles the '*[H]' cap)."""
+    if core_smiles is None or frag_smiles is None:
+        return None
+    core = Chem.MolFromSmiles(core_smiles)
+    if core is None:
+        return None
+    cd = [a.GetIdx() for a in core.GetAtoms() if a.GetAtomicNum() == 0]
+    k = len(cd)
+    if k < 1:
+        return None
+    if k == 1:
+        return _attach(core_smiles, frag_smiles)
+    frag = Chem.MolFromSmiles(frag_smiles)
+    if frag is None:
+        return None
+    fd = [a.GetIdx() for a in frag.GetAtoms() if a.GetAtomicNum() == 0]
+    if len(fd) != k:
+        return None
+    if perm is None:
+        perm = tuple(range(k))
+    if len(perm) != k or sorted(perm) != list(range(k)):
+        return None
+    for i_, j_ in enumerate(perm):
+        core.GetAtomWithIdx(cd[i_]).SetAtomMapNum(i_ + 1)
+        frag.GetAtomWithIdx(fd[j_]).SetAtomMapNum(i_ + 1)
+    try:
+        m = Chem.molzip(Chem.CombineMols(core, frag))
+        Chem.SanitizeMol(m)
+        for a in m.GetAtoms():
+            if a.GetAtomMapNum():
+                a.SetAtomMapNum(0)
+        return Chem.MolToSmiles(m)
+    except Exception:
+        return None
+
+
+def _design_from_pair(site, row, query):
+    """Returns (design_smiles, how) for one multi-cut pair, or (None, why).
+
+    A double/triple cut replaces a whole fragment touching two or three
+    attachment points at once, so a design is that fragment grafted onto the
+    compound's own core. The open question is WHICH fragment end goes where: the
+    deposits cut mol1 and mol2 independently, so the dummy-atom order in R1 and
+    R2 is not a convention. Getting it wrong silently turns cis into trans or
+    moves a substituent to the far end of a ring.
+
+    So the answer is never assumed, it is required to be unambiguous:
+
+      * keep the pairings under which re-attaching the compound's OWN fragment
+        gives the compound back (they are the ones consistent with the deposit);
+      * graft this row's fragment under each of them;
+      * if every such pairing produces the SAME molecule, that molecule is the
+        design regardless of which pairing is "really" right — use it;
+      * if they disagree, this pair cannot pin the pairing down → refuse it.
+
+    `how` is 'multi' when it goes through a join, 'exact' when the matched core
+    is the compound's own core (then the pair's mol2 *is* the design and the
+    grafted molecule is cross-checked against it)."""
+    k = site['n_stars']
+    if k < 2:
+        return None, 'not_multi'
+    perms = list(itertools.permutations(range(k)))
+    fits = [p for p in perms if _attach_k(site['core'], site['R1'], p) == query]
+    if not fits:
+        return None, 'query_not_rebuilt'          # fragment stereo in the deposit is off
+    outs = set()
+    for p in fits:
+        got = _attach_k(site['core'], row['R2'], p)
+        if got is None:
+            return None, 'join_failed'
+        outs.add(got)
+    if len(outs) != 1:
+        return None, 'ambiguous'
+    new = outs.pop()
+    if site['level'] == 0:
+        ex = row.get('example')
+        want = _canon(ex['mol2_smiles']) if (ex is not None and 'mol2_smiles' in ex) else None
+        if want is not None and new != want:
+            return None, 'exact_mismatch'         # graft disagrees with the observed molecule
+    return new, 'multi'
+
+
+def _recut_matches(design_smiles, cut_type, core, frag):
+    """Does the design, cut by the same engine, give back this position's core with
+    the swapped fragment attached?
+
+    This is the only check that catches a deposit whose R1 and R2 dummy-atom
+    orders disagree: the graft then rebuilds the compound correctly but puts the
+    other fragment on backwards (an N-N bond where the observed molecule has a
+    C-N bond, a substituent moved to the far end of a ring, cis for trans). Such a
+    molecule still looks plausible, so it has to be re-cut and compared rather
+    than eyeballed."""
+    mol = Chem.MolFromSmiles(design_smiles)
+    if mol is None:
+        return False
+    want_core, want_frag = _canon(core), _canon(frag)
+    for c in _enumerate_sites(mol):
+        if c['cut_type'] == cut_type and _canon(c['core']) == want_core and _canon(c['R1']) == want_frag:
+            return True
+    return False
+
+
 def _exact_match(series, target):
     ct = _canon(target)
     uniq = series.dropna().unique()
@@ -747,29 +863,52 @@ def build_compound_report(raw, smiles, specs, lang='zh', dataset_name='', max_de
             gains.append(g)
         return bool(gains) and max(gains) >= improve_threshold
 
-    singles = []
+    # Every position that has data can yield designs — including double- and
+    # triple-bond cuts. Those replace a whole fragment that touches two or three
+    # attachment points at once, so the new molecule is built by grafting the
+    # analogue's fragment onto THIS compound's core with an attachment pairing
+    # read off the pair itself (_pair_perm); when no pairing
+    # reconstructs the compound we skip the position instead of guessing.
+    swaps = []
+    multi_how = {'multi': 0, 'exact': 0}
+    multi_dropped = {'query_not_rebuilt': 0, 'ambiguous': 0, 'join_failed': 0,
+                      'exact_mismatch': 0, 'recut_mismatch': 0}
     for s, rows in site_tables:
-        if s['n_stars'] != 1:
-            continue
-        # sanity: re-attaching R1 to the core must give back the compound
-        if _attach(s['core'], s['R1']) != q:
-            continue
         for row in rows:
             if row['R2'] == s['R1'] or not candidate_ok(row):
                 continue
-            new = _attach(s['core'], row['R2'])
+            if s['n_stars'] == 1:
+                if _attach(s['core'], s['R1']) != q:
+                    continue
+                new, how = _attach(s['core'], row['R2']), 'single'
+            else:
+                new, how = _design_from_pair(s, row, q)
+                if new is not None and not _recut_matches(new, s['cut_type'], s['core'], row['R2']):
+                    new, how = None, 'recut_mismatch'
+                if new is None:
+                    if how in multi_dropped:
+                        multi_dropped[how] += 1
+                    continue
+                multi_how[how] += 1
             if new is None or new == q:
                 continue
-            singles.append({'site': s, 'row': row, 'smiles': new, 'grade': _grade(_evidence_stats(row))})
-    # one entry per resulting molecule (best-supported first)
+            swaps.append({'site': s, 'row': row, 'smiles': new,
+                          'kind': 'single' if s['n_stars'] == 1 else 'multi',
+                          'cut_type': s['cut_type'], 'n_stars': s['n_stars'], 'how': how,
+                          'grade': _grade(_evidence_stats(row))})
+    # one entry per resulting molecule, ordered exactly like the headline
+    # "best-supported improving swap" (grade, then gain in the primary
+    # property) so that headline swap is always the first design
     gr = {'A': 0, 'B': 1, 'C': 2}
-    singles.sort(key=lambda d: (gr[d['grade']], -_total_gain(d['row'])))
-    seen_smi, uniq_singles = set(), []
-    for d in singles:
+    swaps.sort(key=lambda d: (gr[d['grade']], -imp(prim, d['row']['per'][prim['label']]['mean']),
+                              -_total_gain(d['row'])))
+    seen_smi, uniq_swaps = set(), []
+    for d in swaps:
         if d['smiles'] in seen_smi:
             continue
         seen_smi.add(d['smiles'])
-        uniq_singles.append(d)
+        uniq_swaps.append(d)
+    uniq_singles = [d for d in uniq_swaps if d['kind'] == 'single']
 
     def predict(base_vals, rows):
         out = {}
@@ -786,9 +925,8 @@ def build_compound_report(raw, smiles, specs, lang='zh', dataset_name='', max_de
                 out[p['label']] = b + sum(deltas)
         return out
 
-    for d in uniq_singles[:max_designs]:
+    for d in uniq_swaps[:max_designs]:
         d['pred'] = predict(base, [d['row']])
-        d['kind'] = 'single'
         designs.append(d)
 
     # additive combinations of two single swaps at different positions
@@ -902,21 +1040,31 @@ def build_compound_report(raw, smiles, specs, lang='zh', dataset_name='', max_de
     if in_dataset:
         parts.append(f'<li>{L(f"数据集里有 <b>{len(analogs)}</b> 个与该化合物直接配对的类似物（其余部分结构相同，仅一处不同）。", f"<b>{len(analogs)}</b> direct analogues (identical apart from one change) are paired with this compound in the dataset.")}</li>')
     parts.append(f'<li>{L(f"它的 {len(sites)} 种切割方式中，<b>{len(sites_with_data)}</b> 种在数据集里有对应位点的数据，<b>{len(sites_no_data)}</b> 种没有。", f"Of its {len(sites)} possible cuts, <b>{len(sites_with_data)}</b> have data at the matching position in the dataset and <b>{len(sites_no_data)}</b> have none.")}</li>')
+    # The headline swap is taken FROM THE DESIGNS, not scored separately: the
+    # designs are already ordered by (grade, gain in the primary property), so the
+    # first non-combination design is exactly the swap a separate scan would pick —
+    # and taking it from there makes it impossible for section 1 to advertise a
+    # swap that section 6 then fails to produce (a real bug before: the headline
+    # could be a double-cut swap that only single-cut sites could turn into a
+    # molecule).
     best = None
-    for s, rows in site_tables:
-        for row in rows:
-            ps = row['per'][prim['label']]
-            if ps['n'] and imp(prim, ps['mean']) > 0:
-                score = (gr[_grade(ps)], -imp(prim, ps['mean']))
-                if best is None or score < best[0]:
-                    best = (score, s, row)
+    for d in designs:
+        if d['kind'] == 'combo':
+            continue
+        ps = d['row']['per'][prim['label']]
+        if ps['n'] and imp(prim, ps['mean']) > 0:
+            best = ((gr[_grade(ps)], -imp(prim, ps['mean'])), d['site'], d['row'])
+        break
     if best:
-        _, s, row = best
-        ps = row['per'][prim['label']]
-        parts.append(f'<li>{L("支持最充分的提升性变换", "Best-supported improving swap")}：{_transform_cell(s["R1"], row["R2"], 70, 55)} '
-                     f'{html.escape(prim["label"])} {L("平均 Δ", "mean Δ")} {ps["mean"]:+.2f}（n={ps["n"]}，{L("证据等级", "grade")} {grade_badge(_grade(ps))}）。</li>')
+        _, bs, brow = best
+        ps = brow['per'][prim['label']]
+        ct_note = '' if bs['n_stars'] == 1 else L(
+            f'，{bs["n_stars"]} 个连接点的整段替换', f', whole-fragment swap over {bs["n_stars"]} attachment points')
+        parts.append(f'<li>{L("支持最充分的提升性变换", "Best-supported improving swap")}：{_transform_cell(bs["R1"], brow["R2"], 70, 55)} '
+                     f'{html.escape(prim["label"])} {L("平均 Δ", "mean Δ")} {ps["mean"]:+.2f}（n={ps["n"]}，{L("证据等级", "grade")} {grade_badge(_grade(ps))}{ct_note}）。'
+                     f'{L("见第 6 节 D1。", "See D1 in section 6.")}</li>')
     else:
-        parts.append(f'<li>{L("在有数据的位点里，没有发现主属性平均向更优方向变化的取代基变换。", "No swap with a mean improvement in the primary property was found at any position with data.")}</li>')
+        parts.append(f'<li>{L("在有数据的位点里，没有找到既提升主属性、又不让其它属性明显变差、并且能拼回一个完整分子的替换。", "No swap at a position with data improved the primary property without hurting the others and could be assembled into a complete molecule.")}</li>')
     parts.append(f'<li>{L(f"共给出 <b>{len(designs)}</b> 个设计（见第 6 节）。", f"<b>{len(designs)}</b> designs are proposed (section 6).")}</li>')
     parts.append('</ul>')
 
@@ -1203,7 +1351,7 @@ def build_compound_report(raw, smiles, specs, lang='zh', dataset_name='', max_de
     # 5 designs
     parts.append(f'<h2>6. {L("推荐的分子设计", "Proposed designs")}</h2>')
     plabels = ', '.join(p['label'] for p in props)
-    parts.append(f'<p>{L(f"目标：<b>{html.escape(prim["label"])}</b> 有提升（平均 Δ ≥ {improve_threshold}），其余属性（{html.escape(plabels)}）不明显变差（Δ ≥ −{worsen_tolerance}，有数据时）。方法：以该化合物的实测值为基准，加上同一位点同一替换的平均 Δ；组合设计假设两处效应可相加，<b>这个假设不一定成立</b>。证据等级：", f"Goal: improve <b>{html.escape(prim["label"])}</b> (mean Δ ≥ {improve_threshold}) without clear loss in the other properties ({html.escape(plabels)}; Δ ≥ −{worsen_tolerance} where data exist). Method: start from the compound’s measured value and add the mean Δ of the same swap at the same position; combinations assume the two effects add up, <b>which may not hold</b>. Grades:")} '
+    parts.append(f'<p>{L(f"目标：<b>{html.escape(prim["label"])}</b> 有提升（平均 Δ ≥ {improve_threshold}），其余属性（{html.escape(plabels)}）不明显变差（Δ ≥ −{worsen_tolerance}，有数据时）。方法：以该化合物的实测值为基准，加上同一位点同一替换的平均 Δ；组合设计假设两处效应可相加，<b>这个假设不一定成立</b>。设计里也包括双切、三切位点的整段片段替换：这种替换同时改动片段覆盖的两个或三个连接位置，Δ 仍来自该替换的实测配对，但改动幅度比单点替换大，证据等级只反映配对数。证据等级：", f"Goal: improve <b>{html.escape(prim["label"])}</b> (mean Δ ≥ {improve_threshold}) without clear loss in the other properties ({html.escape(plabels)}; Δ ≥ −{worsen_tolerance} where data exist). Method: start from the compound’s measured value and add the mean Δ of the same swap at the same position; combinations assume the two effects add up, <b>which may not hold</b>; designs also include whole-fragment swaps at double- and triple-bond cut positions, which change two or three attachment points at once — the Δ still comes from measured pairs of the same swap, but the change is larger than a single-point swap and the grade only reflects the number of pairs. Grades:")} '
                  f'{grade_badge("A")} {L("多对且方向一致", "≥3 consistent pairs")} {grade_badge("B")} {L("多对但不一致，或组合", "several mixed pairs, or a combination")} {grade_badge("C")} {L("仅 1 对", "a single pair")}</p>')
     if designs:
         head = ''.join(f'<th>{html.escape(p["label"])}<br><small>{L("预测 / Δ", "pred. / Δ")}</small></th>' for p in props)
@@ -1216,15 +1364,19 @@ def build_compound_report(raw, smiles, specs, lang='zh', dataset_name='', max_de
                 have = any(r['per'][p['label']]['n'] for r in rows_)
                 pv = d['pred'].get(p['label'])
                 cells += f'<td>{"" if pv is None else f"{pv:.2f}"}{bar(dl if have else None, higher=p["higher"])}</td>'
-            if d['kind'] == 'single':
-                basis = (f'{L("位点", "Position")} {_transform_cell(d["site"]["R1"], d["row"]["R2"], 70, 55)}'
-                         f'<div class="note">n={d["row"]["per"][prim["label"]]["n"]}</div>')
-            else:
+            if d['kind'] == 'combo':
                 basis = (f'{L("两处替换叠加", "Two swaps combined")}：'
                          f'{_transform_cell(d["site"]["R1"], d["row"]["R2"], 70, 55)}'
                          f'<div class="note">n={d["row"]["per"][prim["label"]]["n"]}</div>'
                          f'{_transform_cell(d["site2"]["R1"], d["row2"]["R2"], 70, 55)}'
                          f'<div class="note">n={d["row2"]["per"][prim["label"]]["n"]}</div>')
+            elif d['kind'] == 'multi':
+                basis = (f'{L(f"{d["n_stars"]} 键切割位点，整段片段替换", f"{d["n_stars"]}-bond cut: whole fragment swapped")}'
+                         f' {_transform_cell(d["site"]["R1"], d["row"]["R2"], 70, 55)}'
+                         f'<div class="note">n={d["row"]["per"][prim["label"]]["n"]}</div>')
+            else:
+                basis = (f'{L("位点", "Position")} {_transform_cell(d["site"]["R1"], d["row"]["R2"], 70, 55)}'
+                         f'<div class="note">n={d["row"]["per"][prim["label"]]["n"]}</div>')
             novelty = L('<b>已在数据集中</b>', '<b>already in dataset</b>') if d['smiles'] in all_mols else L('新分子', 'new')
             mw2, lp2, tp2 = (lambda m: (Descriptors.MolWt(m), Crippen.MolLogP(m), rdMolDescriptors.CalcTPSA(m)))(Chem.MolFromSmiles(d['smiles']))
             parts.append(f'<tr><td><b>D{i}</b></td><td class="st">{_mol_cell(d["smiles"], 200, 150)}</td>{cells}'
@@ -1241,7 +1393,7 @@ def build_compound_report(raw, smiles, specs, lang='zh', dataset_name='', max_de
         parts.append('</table>')
 
     # 6 limitations
-    parts.append(f'<h2>7. {L("局限", "Limitations")}</h2><div class="warn">{L("① 位点级统计来自整个数据集，可能混合了不同系列、不同实验批次的数据，跨系列的数字不等于它在这个化合物上的预期效果。② 多数变换只有 1–3 对，没有显著性检验，只能当方向参考。③ 组合设计的预测值是加和假设，两处取代基之间可能有相互作用。④ 只涉及数据集里已有的属性，不含 hERG、代谢稳定性、溶解度等其他信息。⑤ 报告由程序按固定模板生成，不含人工判断。", "(1) Position-level statistics pool the whole dataset, possibly mixing series and assay batches; a wider-match figure is not the expected effect on this compound. (2) Most swaps have 1–3 pairs and no significance test — treat them as directional. (3) Combination predictions assume additivity; the two substituents may interact. (4) Only the properties in this dataset are considered (no hERG, metabolic stability, solubility, …). (5) The report is produced by fixed templates with no human judgement.")}</div>')
+    parts.append(f'<h2>7. {L("局限", "Limitations")}</h2><div class="warn">{L("① 位点级统计来自整个数据集，可能混合了不同系列、不同实验批次的数据，跨系列的数字不等于它在这个化合物上的预期效果。② 多数变换只有 1–3 对，没有显著性检验，只能当方向参考。③ 组合设计的预测值是加和假设，两处取代基之间可能有相互作用；双切、三切设计改的是整段片段，同时动了两个或三个连接位置，性质变化未必只来自该片段本身。④ 只涉及数据集里已有的属性，不含 hERG、代谢稳定性、溶解度等其他信息。⑤ 报告由程序按固定模板生成，不含人工判断。", "(1) Position-level statistics pool the whole dataset, possibly mixing series and assay batches; a wider-match figure is not the expected effect on this compound. (2) Most swaps have 1–3 pairs and no significance test — treat them as directional. (3) Combination predictions assume additivity and the two substituents may interact; double/triple-cut designs replace a whole fragment touching two or three attachment points, so the change may not come from that fragment alone. (4) Only the properties in this dataset are considered (no hERG, metabolic stability, solubility, …). (5) The report is produced by fixed templates with no human judgement.")}</div>')
 
     # 8 master molecule list — every molecule any section-2 fragment card
     # links to (built up via _record_molecule while section 2 was rendered),
@@ -1296,10 +1448,20 @@ function clearMolListFilter() {
         'ranks': {k: {'rank': v[0], 'of': v[1]} for k, v in ranks.items()},
         'n_direct_analogs': len(analogs), 'n_sites': len(sites), 'n_sites_with_data': len(sites_with_data),
         'n_designs': len(designs),
+        'n_multi_designs': sum(1 for d in designs if d['kind'] == 'multi'),
+        'multi_designs_by_check': multi_how, 'multi_designs_dropped': multi_dropped,
         'designs': [{'smiles': d['smiles'], 'grade': d['grade'], 'kind': d['kind'],
+                     'cut_type': d.get('cut_type'), 'n_stars': d.get('n_stars'),
+                     'site_r1': d['site']['R1'] if 'site' in d else None,
+                     'r2': d['row']['R2'] if 'row' in d else None,
+                     'site_level': d['site'].get('level') if 'site' in d else None,
                      'predicted': {k: (round(v, 3) if v is not None else None) for k, v in d['pred'].items()},
                      'already_in_dataset': d['smiles'] in all_mols} for d in designs],
         'best_swap': ({'from': best[1]['R1'], 'to': best[2]['R2'], 'mean_delta': round(best[2]['per'][prim['label']]['mean'], 3),
-                       'n': best[2]['per'][prim['label']]['n']} if best else None),
+                       'n': best[2]['per'][prim['label']]['n'], 'cut_type': best[1]['cut_type'],
+                       'n_stars': best[1]['n_stars'],
+                       'design_id': next((f'D{i}' for i, d in enumerate(designs, 1)
+                                          if d['site'] is best[1] and d['row'] is best[2]), None)}
+                      if best else None),
     }
     return '\n'.join(parts), summary

@@ -6,8 +6,9 @@ description: >-
   molecular pairs (MMP), then writes the report — SAR overview figure (the
   compound in the centre, one coloured region per cut position listing every
   R-group seen there), site map, direct analogues, per-position transformation
-  statistics, rule-based design proposals (single swaps + additive
-  combinations) and a master molecule list. Use this whenever the user gives a
+  statistics, rule-based design proposals (single-point swaps, whole-fragment
+  swaps at double/triple-bond cuts, and additive combinations) and a master
+  molecule list. Use this whenever the user gives a
   compound (SMILES) and a table/SDF of molecules with activity/ADME values and
   wants its SAR, an MMP/SAR report, "给定一个分子提取SAR"、"生成化合物SAR报告"、
   "做MMP分析并出报告"、"这个分子哪些位置可以优化". Standalone: needs only
@@ -21,9 +22,11 @@ MMP pipeline in-process, and writes one HTML report about a chosen compound.
 Deterministic: numbers come from the data, wording from fixed templates.
 
 The code in `scripts/mmpkit/` was extracted unchanged from the original *mmpa*
-project (fragmentation, core abstraction levels 0-5, deposition, report). On the
-same input it produced a **byte-identical** dataset and report to the original
-(checked on a 250-molecule subset of the AZ microsomal-clearance set).
+project (fragmentation, core abstraction levels 0-5, deposition, report) and on
+the same input produced a **byte-identical** dataset and report (checked on a
+250-molecule subset of the AZ microsomal-clearance set). `scripts/mmpkit/report.py`
+is still line-for-line identical to *mmpa*'s `mmp_report.py` except for its two
+imports, so both stay in sync when either is changed.
 
 ## Quick start
 
@@ -71,17 +74,25 @@ analogues  6. Proposed designs  7. Limitations  8. Master molecule list
 (clicking a fragment card in section 2 filters it).
 
 The command prints a JSON summary (measured values/rank, number of analogues
-and positions with data, best-supported swap, designs with grades) — use it to
-answer the user in a few sentences and point to the HTML file.
+and positions with data, best-supported swap with its `cut_type` and
+`design_id`, designs with grade/kind/cut_type, and `multi_designs_by_check` /
+`multi_designs_dropped` for the double/triple-cut ones) — use it to answer the
+user in a few sentences and point to the HTML file. The headline swap is always
+`design_id` D1, so it can never advertise a swap the report does not deliver.
 
 ## Things to tell the user (inherited from the original, not fixed here)
 
 - Grades: A = ≥3 pairs all the same sign, B = ≥2 pairs, C = a single pair.
   Combination designs assume the two effects add up.
-- **Designs only come from single-cut positions.** Double/triple-cut positions
-  appear in the overview and the statistics, but no design is built from them,
-  so the headline "best swap" can be a double-cut swap that never shows up in
-  the designs.
+- **Designs now also come from double/triple-cut positions**, where a whole
+  fragment touching 2-3 attachment points is replaced at once. Those designs are
+  only emitted when the attachment pairing is unambiguous: the pairing is read
+  off the compound itself, every consistent pairing must give the same molecule,
+  and the result is re-cut to confirm it gives back the same core + fragment.
+  Pairs that fail any of that are skipped and counted (`multi_designs_dropped` in
+  the JSON). Say so when reporting: the count can be a large share on some
+  datasets, and the grade of a multi-cut design still reflects only how many
+  pairs back it, not how many atoms change.
 - **Measured values need the absolute values in the data.** Datasets built by
   this skill always carry them; an older dataset without `mol1_value*` columns
   gives deltas only (no ranks, no predicted absolute values).

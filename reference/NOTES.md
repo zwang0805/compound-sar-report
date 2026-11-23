@@ -25,3 +25,23 @@ Extracted on 2026-11-13 from the *mmpa* project (`softwares/mmpa`):
 
 Not tested: datasets above a few thousand molecules (runtime), SDFs with
 disconnected salts, multi-property datasets in `report` beyond reading the columns.
+
+## Later change: designs from double/triple-bond cuts (2026-11-23)
+
+`mmpkit/report.py` gained the same change as *mmpa*'s `mmp_report.py`, so the two
+are still identical apart from imports:
+
+- designs may now come from double/triple-bond cut positions (whole-fragment
+  swap), not only single-bond cuts;
+- the attachment pairing is read off each pair (dummy order is not a convention
+  in the deposits), required to be unambiguous across all pairings consistent
+  with the compound, and every result is re-cut to confirm it returns the same
+  core and fragment; anything that fails is skipped and counted in
+  `multi_designs_dropped`;
+- the headline "best-supported swap" is now taken from the design list itself,
+  so it always carries a `design_id` (D1) instead of advertising a swap the
+  report never builds.
+
+Re-verified after the change: skill report vs *mmpa* report on the same dataset
+and compound = identical output; 32 emitted multi-cut designs across six
+datasets all passed the re-cut check (the check is now part of generation).
