@@ -106,6 +106,7 @@ user in a few sentences and point to the HTML file. The headline swap is always
 ```
 scripts/sar_report.py        CLI (build / report / run)
 scripts/mmpkit/mmp_core.py   SDF I/O + core abstraction levels 0-5
+scripts/mmpkit/sdf.py       SDF record reader (robust: no silent half-loss on Glide exports)
 scripts/mmpkit/frag_index.py single/double/triple-cut fragmentation and pair finding
 scripts/mmpkit/attachment_order.py  attachment-point alignment for multi-cut pairs
 scripts/mmpkit/deposition.py all-levels dataset extraction

@@ -40,16 +40,18 @@ class MMP:
             print(f"文件不存在: {file_path}")
             return
         
-        suppl = Chem.SDMolSupplier(file_path)
+        # mmpkit.sdf, not Chem.SDMolSupplier: RDKit's supplier silently drops every
+        # OTHER record of an SDF whose last data-field value is followed directly by
+        # '$$$$' (Actelion/Glide exports write exactly that), so a 3344-molecule file
+        # loaded as 1672 and printed that as if it were the whole file.
+        from . import sdf as _sdf
         chooser = MolStandardize.rdMolStandardize.LargestFragmentChooser()
-        
-        for i, mol in enumerate(suppl):
-            if num_of_mols > 0 and i >= num_of_mols:
-                break
-            
+        n_records = n_failed = 0
+        for mol, why in _sdf.read_records(file_path, limit=num_of_mols):
+            n_records += 1
             if mol is None:
+                n_failed += 1
                 continue
-            
             if clean:
                 try:
                     cleaned_mol = chooser.choose(mol)
@@ -60,9 +62,9 @@ class MMP:
                     continue
             else:
                 self.mols.append(mol)
-            
-            print(f"\r读取进度: {i+1}", end="")
-        
+
+        if n_failed:
+            print(f'\n有 {n_failed} 个记录无法解析，已跳过（共 {n_records} 个记录）')
         print(f'\n成功读取 {len(self.mols)} 个分子\n')
 
     def _filter_molecule(self, mol):

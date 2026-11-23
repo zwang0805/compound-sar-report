@@ -8,6 +8,7 @@ Extracted on 2026-11-13 from the *mmpa* project (`softwares/mmpa`):
 | `mmpkit/stats.py` | `mmp_stats.py` | none |
 | `mmpkit/frag_index.py` | `mmp_frag_and_index.py` | import path; one regex literal made raw (`r'\[[0-9]*\*\]'`, same pattern, silences a SyntaxWarning) |
 | `mmpkit/deposition.py` | `mmp_deposition.py` | import path |
+| `mmpkit/sdf.py` | `mmp_sdf.py` | none (added later: the robust SDF reader, see below) |
 | `mmpkit/mmp_core.py` | `main.py` (class `MMP`) | only `read_sdf`, `_filter_molecule`, `process_core_structures` and its helpers, `save_molecules` kept; LLM/suggestion/network parts dropped; `_move_to_history` is a no-op (the intermediate MMP SDF stays in the output dir) |
 | `mmpkit/report.py` | `mmp_report.py` | `build_compound_report` and its helpers only (`build_core_report`, which needs the Free-Wilson engine, is not included); two import paths |
 | `sar_report.py` | `server.py` / `mmp_tools.py` pipeline glue | new: CSV→SDF, property-name sanitising (`subtract_<name>_mmp`), spec building, CLI |
@@ -25,6 +26,19 @@ Extracted on 2026-11-13 from the *mmpa* project (`softwares/mmpa`):
 
 Not tested: datasets above a few thousand molecules (runtime), SDFs with
 disconnected salts, multi-property datasets in `report` beyond reading the columns.
+
+## Later change: SDF reading must not lose records (2026-11-23)
+
+`mmpkit/mmp_core.read_sdf` used `Chem.SDMolSupplier`, which silently drops every
+OTHER record of an SDF whose last data-field value is followed directly by `$$$$`
+(Actelion/Glide exports write exactly that: `...Yes\n$$$$\n<next title>`). A
+3344-record file loaded as 1672 molecules and printed that as if it were the whole
+file. `mmpkit/sdf.py` (shared with *mmpa*'s `mmp_sdf.py`) splits the text itself and
+parses each record with `MolFromMolBlock`, keeping the SDF properties on the mol so
+fragmentation/deposition are unchanged; a record that really cannot be parsed is
+counted and reported. Verified: on files that already loaded correctly the molecule
+list, order, names and every property value are identical, and the all-levels
+dataset built from the 97-molecule test SDF is byte-identical to the pre-change run.
 
 ## Later change: designs from double/triple-bond cuts (2026-11-23)
 
